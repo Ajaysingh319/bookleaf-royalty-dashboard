@@ -1,0 +1,502 @@
+{
+  "name": "BookLeaf Royalty Summary",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## BookLeaf royalty summary\nBubble button -> POST webhook (X-BookLeaf-Secret header) with the author + books ->\nvalidate -> duplicate guard -> deterministic royalty maths (Code) -> Gemini writes the email text ->\noutput validated (fallback template if the AI fails or invents a number) -> reply to Bubble,\nwhich records Success / Failed / Skipped in its Notification Log.\n\nCredentials to create after import (values are never stored in this file):\n1. BookLeaf Webhook Secret (Header Auth: name X-BookLeaf-Secret)\n2. Gemini API Key (Header Auth: name x-goog-api-key)",
+        "height": 240,
+        "width": 560
+      },
+      "name": "Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -140
+      ],
+      "id": "bl-01-notes"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "bookleaf-royalty-summary",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "b00c1ea5-0000-4000-8000-0a11a0000001",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "yOqZt8wcAd9fxTCW",
+          "name": "BookLeaf Webhook Secret"
+        }
+      },
+      "id": "bl-02-webhook"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "gemini_model",
+              "name": "gemini_model",
+              "value": "gemini-3.5-flash-lite",
+              "type": "string"
+            },
+            {
+              "id": "overdue_days",
+              "name": "overdue_days",
+              "value": 90,
+              "type": "number"
+            },
+            {
+              "id": "payout_window_days",
+              "name": "payout_window_days",
+              "value": 45,
+              "type": "number"
+            },
+            {
+              "id": "today_override",
+              "name": "today_override",
+              "value": "",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "name": "Settings",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        300
+      ],
+      "id": "bl-03-settings"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate Request: checks the JSON payload sent by Bubble (author + books). Webhook authentication\n// (shared-secret header) is enforced by n8n's Header Auth credential before this node runs.\nconst j = $input.first().json;\nconst b = (j && j.body && typeof j.body === 'object') ? j.body : {};\nconst errors = [];\n\nconst a = (b.author && typeof b.author === 'object') ? b.author : {};\nconst author = {\n  author_id: typeof a.author_id === 'string' ? a.author_id.trim() : '',\n  name: typeof a.name === 'string' ? a.name.trim() : '',\n  email: typeof a.email === 'string' ? a.email.trim() : '',\n  city: typeof a.city === 'string' ? a.city.trim() : '',\n};\nif (!author.author_id) errors.push('author.author_id is missing');\nelse if (!/^AUTH\\d{3,}$/.test(author.author_id)) errors.push('author.author_id has an invalid format (expected e.g. AUTH001)');\nif (!author.name) errors.push('author.name is missing');\n\nif (!Array.isArray(b.books)) errors.push('books must be a list');\nconst books = Array.isArray(b.books) ? b.books.filter((x) => x && typeof x === 'object') : [];\n\nconst trigger = ['Single', 'Bulk'].includes(b.trigger) ? b.trigger : 'Single';\n\nreturn [{\n  json: {\n    valid: errors.length === 0,\n    errors,\n    author_id: author.author_id,\n    author,\n    books,\n    request_id: (typeof b.request_id === 'string' && b.request_id.trim()) || `${author.author_id}-${Date.now()}`,\n    trigger,\n    execution_id: $execution.id,\n    received_at: new Date().toISOString(),\n  },\n}];\n"
+      },
+      "name": "Validate Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "id": "bl-04-validate-request"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Request Valid?",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Request Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        300
+      ],
+      "id": "bl-05-request-valid-"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'rejected', errors: $json.errors, execution_id: $json.execution_id }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "name": "Respond 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        520
+      ],
+      "id": "bl-06-respond-400"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Duplicate Guard (idempotency): the same author (or the same request_id) inside the window is ignored.\n// State lives in n8n workflow static data, which persists between production executions.\nconst v = $input.first().json;\nconst WINDOW_MS = 60 * 1000;\nconst sd = $getWorkflowStaticData('global');\nsd.recent = sd.recent || {};\nconst now = Date.now();\n\nfor (const k of Object.keys(sd.recent)) {\n  if (now - sd.recent[k].t > WINDOW_MS * 10) delete sd.recent[k];\n}\n\nconst prev = sd.recent[v.author_id];\nconst sameRequest = Object.values(sd.recent).some((e) => e.request_id === v.request_id);\nlet duplicate = false;\nlet reason = '';\nif (prev && now - prev.t < WINDOW_MS) {\n  duplicate = true;\n  reason = `Duplicate request ignored: ${v.author_id} was already triggered ${Math.round((now - prev.t) / 1000)}s ago`;\n} else if (sameRequest) {\n  duplicate = true;\n  reason = `Duplicate request ignored: request_id ${v.request_id} was already processed`;\n}\n\nif (!duplicate) sd.recent[v.author_id] = { t: now, request_id: v.request_id };\n\nreturn [{ json: { ...v, duplicate, duplicate_reason: reason } }];\n"
+      },
+      "name": "Duplicate Guard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        200
+      ],
+      "id": "bl-07-duplicate-guard"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Is Duplicate?",
+              "leftValue": "={{ $json.duplicate }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        200
+      ],
+      "id": "bl-08-is-duplicate-"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'duplicate_ignored', author_id: $('Duplicate Guard').first().json.author_id, reason: $('Duplicate Guard').first().json.duplicate_reason, execution_id: $execution.id, completed_at: new Date().toISOString() }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "Respond Duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        60
+      ],
+      "id": "bl-09-respond-duplicate"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate: deterministic royalty summary. NO AI involved. Supplied Bubble figures are never overwritten;\n// they are validated, summed in integer paise (no float drift) and checked for consistency.\nconst req = $('Duplicate Guard').first().json;\nconst author = req.author;\nconst cfg = $('Settings').first().json;\nconst raw = Array.isArray(req.books) ? req.books : [];\n\nif (raw.length === 0) {\n  throw new Error(`No books were sent for ${author.author_id} (${author.name}); nothing to summarise`);\n}\n\nconst OVERDUE_DAYS = Number(cfg.overdue_days) || 90;\nconst WINDOW_DAYS = Number(cfg.payout_window_days) || 45;\nconst now = cfg.today_override ? new Date(cfg.today_override) : new Date();\nif (isNaN(now.getTime())) throw new Error('Invalid today_override setting');\nconst DAY = 86400000;\n\nconst norm = (o) => {\n  const r = {};\n  for (const k of Object.keys(o)) r[k.toLowerCase().replace(/[^a-z0-9]/g, '')] = o[k];\n  return r;\n};\nconst pick = (o, ...names) => {\n  for (const n of names) if (o[n] !== undefined && o[n] !== null && o[n] !== '') return o[n];\n  return null;\n};\n// Returns null when missing; throws on non-numeric / negative / non-finite values.\nconst num = (v, field, label) => {\n  if (v === null || v === undefined || v === '') return null;\n  const x = typeof v === 'number' ? v : (typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN);\n  if (!Number.isFinite(x)) throw new Error(`Invalid ${field} \"${v}\" for ${label}`);\n  if (x < 0) throw new Error(`Negative ${field} (${x}) for ${label}`);\n  return x;\n};\nconst cents = (x) => Math.round(x * 100);\nconst rupees = (c) => c / 100;\nconst asDate = (v) => {\n  if (!v) return null;\n  const d = new Date(v);\n  return isNaN(d.getTime()) ? null : d;\n};\nconst iso = (d) => (d ? d.toISOString().slice(0, 10) : null);\n\nconst warnings = [];\nconst books = [];\nlet tEarned = 0, tPaid = 0, tPending = 0;\n\nfor (const rb of raw) {\n  const b = norm(rb);\n  const bookId = pick(b, 'bookid') || rb._id;\n  const title = pick(b, 'title', 'booktitle', 'name') || '(untitled)';\n  const label = `book ${bookId} \"${title}\"`;\n  const status = String(pick(b, 'status') || '').trim();\n  const published = /^published/i.test(status);\n  const inProduction = /^in production/i.test(status);\n\n  const copies = num(pick(b, 'copiessold', 'totalcopiessold'), 'copies sold', label);\n  const rate = num(pick(b, 'authorroyaltypercopy', 'royaltypercopy'), 'royalty per copy', label);\n  const mrp = num(pick(b, 'mrp'), 'MRP', label);\n  const earned = num(pick(b, 'royaltyearned', 'totalroyaltyearned'), 'royalty earned', label);\n  const paid = num(pick(b, 'royaltypaid'), 'royalty paid', label);\n  const pending = num(pick(b, 'royaltypending'), 'royalty pending', label);\n\n  if (published && (earned === null || paid === null || pending === null)) {\n    throw new Error(`Missing royalty fields (earned/paid/pending) for published ${label}`);\n  }\n  const eC = cents(earned ?? 0), paC = cents(paid ?? 0), peC = cents(pending ?? 0);\n\n  if (published && earned !== null && paid !== null && pending !== null && eC - paC !== peC) {\n    warnings.push(`${label}: pending (${pending}) differs from earned - paid (${rupees(eC - paC)})`);\n  }\n  if (published && copies !== null && rate !== null && earned !== null && cents(copies * rate) !== eC) {\n    warnings.push(`${label}: earned (${earned}) differs from copies x rate (${rupees(cents(copies * rate))})`);\n  }\n\n  const pubDate = asDate(pick(b, 'publication', 'publicationdate'));\n  const lastPayout = asDate(pick(b, 'lastpayout', 'lastroyaltypayoutdate'));\n\n  // Royalty status badge (brief, A2): Green = nothing pending; Red = pending AND (last payout > 90 days ago,\n  // or never paid for a published book older than 90 days); Yellow = pending but within the normal cycle.\n  let badge = 'n/a';\n  if (published) {\n    if (peC === 0) badge = 'green';\n    else if (lastPayout) badge = (now - lastPayout) / DAY > OVERDUE_DAYS ? 'red' : 'yellow';\n    else badge = pubDate && (now - pubDate) / DAY > OVERDUE_DAYS ? 'red' : 'yellow';\n  }\n\n  if (published) { tEarned += eC; tPaid += paC; tPending += peC; }\n\n  books.push({\n    book_id: bookId,\n    title,\n    status,\n    published,\n    in_production: inProduction,\n    genre: pick(b, 'genre'),\n    isbn: pick(b, 'isbn'),\n    publication_date: iso(pubDate),\n    mrp,\n    royalty_per_copy: rate,\n    copies_sold: copies ?? 0,\n    royalty_earned: rupees(eC),\n    royalty_paid: rupees(paC),\n    royalty_pending: rupees(peC),\n    last_payout_date: iso(lastPayout),\n    badge,\n    platforms: Array.isArray(pick(b, 'platforms')) ? pick(b, 'platforms') : [],\n  });\n}\n\nif (!books.some((b) => b.published) && !books.some((b) => b.in_production)) {\n  throw new Error(`No usable books for ${author.author_id}`);\n}\nif (tEarned - tPaid !== tPending) {\n  warnings.push(`Totals: pending (${rupees(tPending)}) differs from earned - paid (${rupees(tEarned - tPaid)})`);\n}\n\n// Payout timing (brief B): payouts are quarterly with a 45-day window. Royalties for a finished quarter are\n// expected within 45 days after quarter end; if that window has already passed, the next window applies.\nconst quarterEnd = (d, offset) => {\n  const q = Math.floor(d.getUTCMonth() / 3) + offset;\n  const year = d.getUTCFullYear() + Math.floor(q / 4);\n  const qi = ((q % 4) + 4) % 4;\n  return new Date(Date.UTC(year, qi * 3 + 3, 0));\n};\nconst prevEnd = quarterEnd(now, -1);\nconst currEnd = quarterEnd(now, 0);\nconst prevWindowEnd = new Date(prevEnd.getTime() + WINDOW_DAYS * DAY);\nconst currWindowEnd = new Date(currEnd.getTime() + WINDOW_DAYS * DAY);\nconst useWindow = prevWindowEnd >= now ? prevWindowEnd : currWindowEnd;\nconst useQuarterEnd = prevWindowEnd >= now ? prevEnd : currEnd;\n\nconst hasPending = tPending > 0;\nreturn [{\n  json: {\n    author,\n    reference_date: iso(now),\n    books,\n    totals: { earned: rupees(tEarned), paid: rupees(tPaid), pending: rupees(tPending) },\n    flags: {\n      has_pending: hasPending,\n      all_paid: !hasPending && books.some((b) => b.published),\n      has_overdue: books.some((b) => b.badge === 'red'),\n      in_production_count: books.filter((b) => b.in_production).length,\n    },\n    next_payout: hasPending ? {\n      quarter_end: iso(useQuarterEnd),\n      expected_by: iso(useWindow),\n    } : null,\n    warnings,\n  },\n}];\n"
+      },
+      "name": "Calculate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "onError": "continueErrorOutput",
+      "id": "bl-10-calculate"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Prompt: the AI only receives pre-calculated, verified facts and writes the wording.\nconst facts = $input.first().json;\nconst cfg = $('Settings').first().json;\n\nconst inr = (x) => '₹' + Number(x).toLocaleString('en-IN', { maximumFractionDigits: 2 });\nconst authorFacts = {\n  author_name: facts.author.name,\n  reference_date: facts.reference_date,\n  published_books: facts.books.filter((b) => b.published).map((b) => ({\n    title: b.title,\n    copies_sold: b.copies_sold,\n    royalty_earned: inr(b.royalty_earned),\n    royalty_paid: inr(b.royalty_paid),\n    royalty_pending: inr(b.royalty_pending),\n    last_payout_date: b.last_payout_date || 'no payout has been made yet',\n  })),\n  books_in_production: facts.books.filter((b) => b.in_production).map((b) => ({\n    title: b.title,\n    stage: b.status,\n  })),\n  totals: {\n    total_earned: inr(facts.totals.earned),\n    total_paid: inr(facts.totals.paid),\n    total_pending: inr(facts.totals.pending),\n  },\n  all_royalties_paid: facts.flags.all_paid,\n  next_payout: facts.next_payout\n    ? { expected_by: facts.next_payout.expected_by, quarter_end: facts.next_payout.quarter_end }\n    : null,\n};\n\nconst system = [\n  'You write royalty summary emails for BookLeaf Publishing authors.',\n  'Tone: warm, professional, clear and respectful. Plain language, no hype, no jargon.',\n  'STRICT RULES:',\n  '1. Use ONLY the facts in the JSON provided. Never invent, estimate, round or recalculate any number, date, title or status.',\n  '2. Copy every rupee amount exactly as written in the JSON (including the ₹ symbol).',\n  '3. Greet the author by name. Summarise each published book (copies sold, earned, paid, pending, last payout date).',\n  '4. Give a clear breakdown of total earned, total paid and total pending.',\n  '5. If next_payout is not null, explain that BookLeaf pays royalties quarterly and that payment is expected within 45 days of the quarter end, naming the expected_by date. Do not promise an exact payment day.',\n  '6. If all_royalties_paid is true, warmly acknowledge that everything is paid up.',\n  '7. If books_in_production is not empty, add a short status update for each such book (title and stage only).',\n  '8. End with a warm, professional closing signed \"Team BookLeaf\".',\n  'Return JSON with exactly two string fields: \"subject\" and \"body\" (plain text, paragraphs separated by blank lines).',\n].join('\\n');\n\nconst geminiBody = {\n  systemInstruction: { parts: [{ text: system }] },\n  contents: [{ role: 'user', parts: [{ text: 'Facts (JSON):\\n' + JSON.stringify(authorFacts, null, 2) }] }],\n  generationConfig: {\n    temperature: 0.3,\n    maxOutputTokens: 2000,\n    thinkingConfig: { thinkingLevel: 'low' },\n    responseMimeType: 'application/json',\n    responseSchema: {\n      type: 'OBJECT',\n      properties: { subject: { type: 'STRING' }, body: { type: 'STRING' } },\n      required: ['subject', 'body'],\n    },\n  },\n};\n\nreturn [{ json: { geminiBody, model: cfg.gemini_model } }];\n"
+      },
+      "name": "Build Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        300
+      ],
+      "id": "bl-11-build-prompt"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $('Build Prompt').first().json.model }}:generateContent",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build Prompt').first().json.geminiBody) }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 25000
+        }
+      },
+      "name": "Gemini",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1760,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "wLHZDlWJsZB9Ixmd",
+          "name": "Gemini API Key"
+        }
+      },
+      "retryOnFail": false,
+      "onError": "continueErrorOutput",
+      "id": "bl-12-gemini"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compose Email: validates the AI output against the calculated facts; on any problem (AI error, bad JSON,\n// invented amounts, missing author name/pending total) it falls back to a deterministic template.\nconst facts = $('Calculate').first().json;\nconst input = $input.first().json || {};\n\nconst inr = (x) => '₹' + Number(x).toLocaleString('en-IN', { maximumFractionDigits: 2 });\nconst published = facts.books.filter((b) => b.published);\nconst production = facts.books.filter((b) => b.in_production);\n\nfunction template() {\n  const lines = [`Dear ${facts.author.name},`, '', 'Here is your royalty summary from BookLeaf Publishing.', ''];\n  for (const b of published) {\n    lines.push(`• ${b.title}: ${b.copies_sold} copies sold; royalty earned ${inr(b.royalty_earned)}, paid ${inr(b.royalty_paid)}, pending ${inr(b.royalty_pending)}; ` +\n      `last payout: ${b.last_payout_date || 'no payout made yet'}.`);\n  }\n  lines.push('', `Total earned: ${inr(facts.totals.earned)}`, `Total paid: ${inr(facts.totals.paid)}`, `Total pending: ${inr(facts.totals.pending)}`, '');\n  if (facts.flags.has_pending && facts.next_payout) {\n    lines.push(`BookLeaf pays royalties quarterly, and payment is expected within 45 days of the quarter end. Your next payout is expected by ${facts.next_payout.expected_by}.`, '');\n  } else if (facts.flags.all_paid) {\n    lines.push('Great news: all of your royalties are fully paid up. Thank you for being part of BookLeaf!', '');\n  }\n  for (const b of production) {\n    lines.push(`Update: \"${b.title}\" is currently in production (${b.status}).`);\n  }\n  if (production.length) lines.push('');\n  lines.push('If you have any questions, simply reply to this email and we will be happy to help.', '', 'Warm regards,', 'Team BookLeaf');\n  return { subject: 'Your BookLeaf royalty summary', body: lines.join('\\n') };\n}\n\n// ---- allowed numbers (everything the AI is permitted to quote in rupees)\nconst allowed = new Set();\nconst add = (x) => { if (typeof x === 'number' && Number.isFinite(x)) allowed.add(x.toFixed(2)); };\n['earned', 'paid', 'pending'].forEach((k) => add(facts.totals[k]));\nfor (const b of facts.books) {\n  ['royalty_earned', 'royalty_paid', 'royalty_pending', 'mrp', 'royalty_per_copy'].forEach((k) => add(b[k]));\n}\n\nfunction checkAi(text) {\n  let parsed;\n  try { parsed = JSON.parse(text); } catch (e) { return { ok: false, why: 'AI response was not valid JSON' }; }\n  if (!parsed || typeof parsed.subject !== 'string' || typeof parsed.body !== 'string' ||\n      !parsed.subject.trim() || parsed.body.trim().length < 80) {\n    return { ok: false, why: 'AI response missing subject/body or too short' };\n  }\n  const re = /(?:₹|Rs\\.?\\s?|INR\\s?)\\s*([\\d,]+(?:\\.\\d{1,2})?)/gi;\n  let m;\n  while ((m = re.exec(parsed.body)) !== null) {\n    const v = Number(m[1].replace(/,/g, ''));\n    if (!allowed.has(v.toFixed(2))) return { ok: false, why: `AI quoted an amount not in the verified data: ${m[0]}` };\n  }\n  const first = facts.author.name.split(/\\s+/)[0].toLowerCase();\n  if (!parsed.body.toLowerCase().includes(first)) return { ok: false, why: 'AI email does not greet the author by name' };\n  if (facts.flags.has_pending && !parsed.body.includes(inr(facts.totals.pending))) {\n    return { ok: false, why: 'AI email omits the verified total pending amount' };\n  }\n  for (const b of published) {\n    if (!parsed.body.includes(b.title)) return { ok: false, why: `AI email omits book title \"${b.title}\"` };\n  }\n  return { ok: true, subject: parsed.subject.trim(), body: parsed.body.trim() };\n}\n\nlet source = 'template';\nlet aiProblem = '';\nlet email = null;\n\nconst cand = input.candidates && input.candidates[0];\nconst text = cand && cand.content && cand.content.parts && cand.content.parts.map((p) => p.text || '').join('');\nif (input.error || !text) {\n  const why = input.error ? (input.error.message || input.error) : 'empty AI response';\n  aiProblem = ('AI call failed: ' + (typeof why === 'string' ? why : JSON.stringify(why))).slice(0, 300);\n} else {\n  const r = checkAi(text);\n  if (r.ok) { source = 'ai'; email = { subject: r.subject, body: r.body }; }\n  else aiProblem = r.why;\n}\nif (!email) email = template();\n\nreturn [{\n  json: {\n    subject: email.subject,\n    body: email.body,\n    summary_text: `Subject: ${email.subject}\\n\\n${email.body}`,\n    source,\n    ai_problem: aiProblem,\n    totals: facts.totals,\n    warnings: facts.warnings,\n  },\n}];\n"
+      },
+      "name": "Compose Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        300
+      ],
+      "onError": "continueErrorOutput",
+      "id": "bl-13-compose-email"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'success', execution_id: $execution.id, author_id: $('Duplicate Guard').first().json.author_id, request_id: $('Duplicate Guard').first().json.request_id, email_source: $('Compose Email').first().json.source, ai_problem: $('Compose Email').first().json.ai_problem, subject: $('Compose Email').first().json.subject, summary_text: $('Compose Email').first().json.summary_text, totals: $('Compose Email').first().json.totals, warnings: $('Compose Email').first().json.warnings, completed_at: new Date().toISOString() }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2200,
+        240
+      ],
+      "id": "bl-14-respond-success"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Failure: single funnel for every failed step. The text goes back to Bubble in the webhook reply,\n// where Bubble records it in the Notification Log (Status = Failed, Error = this text).\nconst j = $input.first().json || {};\nlet ctx = {};\ntry { ctx = $('Duplicate Guard').first().json; } catch (e) { ctx = {}; }\n\nlet msg = '';\nconst e = j.error;\nif (typeof e === 'string') msg = e;\nelse if (e && typeof e === 'object') msg = e.message || e.description || JSON.stringify(e);\nelse if (j.message) msg = j.message;\nelse msg = JSON.stringify(j);\nmsg = String(msg).replace(/\\s+/g, ' ').slice(0, 400);\n\nreturn [{\n  json: {\n    author_id: ctx.author_id,\n    execution_id: $execution.id,\n    error_text: `[n8n execution ${$execution.id}] ${msg}`,\n    failed_at: new Date().toISOString(),\n  },\n}];\n"
+      },
+      "name": "Build Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        560
+      ],
+      "id": "bl-15-build-failure"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'failed', execution_id: $execution.id, author_id: $json.author_id, error: $json.error_text, completed_at: new Date().toISOString() }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "Respond Failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1980,
+        560
+      ],
+      "id": "bl-16-respond-failed"
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Validate Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Request": {
+      "main": [
+        [
+          {
+            "node": "Request Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Valid?": {
+      "main": [
+        [
+          {
+            "node": "Duplicate Guard",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 400",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Duplicate Guard": {
+      "main": [
+        [
+          {
+            "node": "Is Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Respond Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Calculate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate": {
+      "main": [
+        [
+          {
+            "node": "Build Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Prompt": {
+      "main": [
+        [
+          {
+            "node": "Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini": {
+      "main": [
+        [
+          {
+            "node": "Compose Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Email": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Failure": {
+      "main": [
+        [
+          {
+            "node": "Respond Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
